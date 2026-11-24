@@ -30,10 +30,86 @@ except Exception:  # noqa: BLE001
     mpv = None
     MPV_OK = False
 
-VERSION = "1.0"
+VERSION = "1.1"
+AUTO_LIMIT_MIN = 5 * 60       # "Grabar ahora" + "Hasta que la pare": tope de 5 h
+WARN_BEFORE_MIN = 10          # aviso a las 4 h 50 min
+EXTEND_MIN = 5 * 60           # si aceptas, 5 h más
+
+
+class Cancelled(Exception):
+    """El usuario canceló la acción (no es un error)."""
 RED = "#d63a3a"
 RED_HOVER = "#b02a2a"
 DEFAULT_FOLDER = r"C:\grabaciones" if os.name == "nt" else os.path.join(os.path.expanduser("~"), "grabaciones")
+
+
+def icon_path() -> str | None:
+    """Busca icono.ico (dentro del .exe o en la raíz del proyecto)."""
+    for d in (core.app_dir(), os.path.dirname(core.app_dir())):
+        p = os.path.join(d, "icono.ico")
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def set_icon(win):
+    p = icon_path()
+    if p and os.name == "nt":
+        try:
+            win.iconbitmap(p)
+        except Exception:  # noqa: BLE001
+            pass
+    elif p:
+        try:  # Linux/macOS: iconphoto con PNG convertido
+            from PIL import ImageTk
+            win._icon_img = ImageTk.PhotoImage(Image.open(p))
+            win.iconphoto(True, win._icon_img)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def add_context_menu(entry, extra=None):
+    """Clic derecho en un CTkEntry: Cortar / Copiar / Pegar / Seleccionar todo."""
+    w = getattr(entry, "_entry", entry)
+    menu = tk.Menu(w, tearoff=0)
+
+    def do(ev):
+        w.focus_set()
+        w.event_generate(ev)
+
+    def select_all():
+        w.focus_set()
+        w.select_range(0, "end")
+        w.icursor("end")
+
+    if extra:
+        for label, fn in extra:
+            menu.add_command(label=label, command=fn)
+        menu.add_separator()
+    menu.add_command(label="Cortar", command=lambda: do("<<Cut>>"))
+    menu.add_command(label="Copiar", command=lambda: do("<<Copy>>"))
+    menu.add_command(label="Pegar", command=lambda: do("<<Paste>>"))
+    menu.add_separator()
+    menu.add_command(label="Seleccionar todo", command=select_all)
+
+    def show(event):
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    w.bind("<Button-3>", show)
+    if sys.platform == "darwin":
+        w.bind("<Button-2>", show)
+
+
+def add_text_context_menu(textbox):
+    """Clic derecho en el registro: Copiar / Seleccionar todo."""
+    w = getattr(textbox, "_textbox", textbox)
+    menu = tk.Menu(w, tearoff=0)
+    menu.add_command(label="Copiar", command=lambda: w.event_generate("<<Copy>>"))
+    menu.add_command(label="Seleccionar todo", command=lambda: w.tag_add("sel", "1.0", "end"))
+    w.bind("<Button-3>", lambda e: menu.tk_popup(e.x_root, e.y_root))
 
 
 def open_path(path: str):
@@ -53,6 +129,7 @@ class App(ctk.CTk):
         self.title(f"Grabador de Directos {VERSION}")
         self.geometry("1280x800")
         self.minsize(1100, 700)
+        set_icon(self)  # icono de la ventana y de la barra de tareas
 
         self.cfg = core.load_json("config.json", {})
         self.ui_queue: queue.Queue = queue.Queue()
@@ -62,6 +139,8 @@ class App(ctk.CTk):
         self.name_edited = False
         self.player = None
         self._thumb_img = None
+        self.preview_on = False
+        self._limit_dialogs: dict[str, "LimitDialog"] = {}
 
         self._build_layout()
         self.scheduler = core.Scheduler(self._launch_from_scheduler, log=self.log)
@@ -84,6 +163,8 @@ class App(ctk.CTk):
         self._build_form(ctk.CTkFrame(self))
         self._build_preview(ctk.CTkFrame(self))
         self._build_tabs()
+        self._attach_context_menus(self)
+        add_text_context_menu(self.log_box)
 
     def _build_form(self, f):
         f.grid(row=0, column=0, sticky="nsew", padx=(12, 6), pady=12)
@@ -92,6 +173,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(f, text="Enlace", font=ctk.CTkFont(weight="bold")).grid(row=r, column=0, sticky="w", padx=10, pady=(10, 4))
         self.url_var = tk.StringVar(value=self.cfg.get("last_url", ""))
         e = ctk.CTkEntry(f, textvariable=self.url_var, placeholder_text="https://www.youtube.com/watch?v=…")
+        self.url_entry = e
         e.grid(row=r, column=1, sticky="ew", padx=4, pady=(10, 4))
         e.bind("<Return>", lambda _e: self.analyze())
         ctk.CTkButton(f, text="Comprobar", width=100, command=self.analyze).grid(row=r, column=2, padx=(4, 10), pady=(10, 4))
@@ -196,8 +278,9 @@ class App(ctk.CTk):
         self.vol = ctk.CTkSlider(ctl, from_=0, to=100, width=140, command=lambda _v: self._apply_audio())
         self.vol.set(60)
         self.vol.pack(side="left", padx=6)
-        ctk.CTkButton(ctl, text="Parar vista previa", width=130, fg_color="gray30",
-                      command=self.stop_preview).pack(side="right")
+        self.preview_btn = ctk.CTkButton(ctl, text="■  Parar vista previa", width=170, fg_color="gray30",
+                                         command=self.toggle_preview, state="disabled")
+        self.preview_btn.pack(side="right")
 
     def _build_tabs(self):
         tabs = ctk.CTkTabview(self, height=260)
@@ -231,6 +314,23 @@ class App(ctk.CTk):
         self.log_box = ctk.CTkTextbox(t_log, font=ctk.CTkFont(family="Consolas", size=12))
         self.log_box.grid(row=0, column=0, sticky="nsew")
         self.log_box.configure(state="disabled")
+
+    def _attach_context_menus(self, parent):
+        for w in parent.winfo_children():
+            if isinstance(w, ctk.CTkEntry):
+                if w is getattr(self, "url_entry", None):
+                    add_context_menu(w, extra=[("Pegar y comprobar", self._paste_and_check)])
+                else:
+                    add_context_menu(w)
+            self._attach_context_menus(w)
+
+    def _paste_and_check(self):
+        try:
+            text = self.clipboard_get().strip()
+        except tk.TclError:
+            return
+        self.url_var.set(text)
+        self.analyze()
 
     # ----------------------------------------------------------- helpers
     def ui(self, fn, *args):
@@ -290,6 +390,19 @@ class App(ctk.CTk):
         folder = self.folder_var.get().strip()
         if not folder:
             raise ValueError("Elige una carpeta de destino.")
+        folder = os.path.normpath(os.path.expandvars(os.path.expanduser(folder)))
+        if not os.path.isdir(folder):
+            if os.path.exists(folder):
+                raise ValueError(f"«{folder}» es un archivo, no una carpeta.")
+            if not messagebox.askyesno("Carpeta no encontrada",
+                                       f"La carpeta\n\n{folder}\n\nno existe. ¿Quieres crearla?"):
+                raise Cancelled()
+            try:
+                os.makedirs(folder, exist_ok=True)
+            except OSError as e:
+                raise ValueError(f"No se pudo crear la carpeta:\n{folder}\n\n{e.strerror or e}")
+            self.log(f"Carpeta creada: {folder}")
+            self.folder_var.set(folder)
         duration = 0
         if self.mode_var.get() == "Duración fija":
             duration = self._int(self.hours_var, "horas") * 60 + self._int(self.mins_var, "minutos")
@@ -359,6 +472,8 @@ class App(ctk.CTk):
             self.start_preview(info.preview_url)
         else:
             self.stop_preview(keep_thumb=True)
+        if info.kind == "directo" and not MPV_OK:
+            self.log("Vista previa en vivo no disponible (falta libmpv-2.dll).")
         if then:
             then()
 
@@ -398,9 +513,12 @@ class App(ctk.CTk):
             self._apply_audio()
             self.player.play(url)
             self.thumb_lbl.lower(self.video_frame)
+            self.preview_on = True
         except Exception as e:  # noqa: BLE001
             self.log(f"No se pudo iniciar la vista previa: {e}")
             self.thumb_lbl.lift()
+            self.preview_on = False
+        self._update_preview_btn()
 
     def stop_preview(self, keep_thumb: bool = True):
         if self.player is not None:
@@ -409,8 +527,41 @@ class App(ctk.CTk):
             except Exception:  # noqa: BLE001
                 pass
         self.thumb_lbl.lift()
+        self.preview_on = False
         if not keep_thumb:
             self._set_thumb(None)
+        self._update_preview_btn()
+
+    def _update_preview_btn(self):
+        can = MPV_OK and self.info is not None and self.info.kind == "directo"
+        if self.preview_on:
+            self.preview_btn.configure(text="■  Parar vista previa", state="normal")
+        else:
+            self.preview_btn.configure(text="▶  Reanudar vista previa", state="normal" if can else "disabled")
+
+    def toggle_preview(self):
+        if self.preview_on:
+            self.stop_preview()
+            return
+        if not (MPV_OK and self.info and self.info.kind == "directo"):
+            return
+        self.preview_btn.configure(text="Cargando…", state="disabled")
+        url = self.info.url
+
+        def work():
+            # Pedimos una URL nueva: las de YouTube caducan al cabo de unas horas.
+            try:
+                fresh = core.preview_url_for(url)
+            except Exception as e:  # noqa: BLE001
+                fresh = None
+                self.log(f"Vista previa: {e}")
+            if fresh:
+                self.ui(self.start_preview, fresh)
+            else:
+                self.log("El directo no está emitiendo ahora mismo.")
+                self.ui(self._update_preview_btn)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _apply_audio(self):
         if self.player is not None:
@@ -424,6 +575,8 @@ class App(ctk.CTk):
     def record_now(self):
         try:
             cfg = self._collect()
+        except Cancelled:
+            return
         except ValueError as e:
             messagebox.showwarning("Revisa los datos", str(e))
             return
@@ -435,6 +588,8 @@ class App(ctk.CTk):
                                        "¿Grabar igualmente y esperar a que empiece (con los reintentos configurados)?"):
                 return
         cfg.kind = "video" if self.info.kind == "video" else "directo"
+        if cfg.duration_min == 0 and cfg.kind == "directo":
+            cfg.auto_limit_min = AUTO_LIMIT_MIN
         self._start_recording(cfg)
 
     def _launch_from_scheduler(self, cfg: core.JobConfig):
@@ -445,7 +600,14 @@ class App(ctk.CTk):
         self.recordings.append(rec)
         rec.start()
         self._add_rec_row(rec)
-        dur = f"{cfg.duration_min} min" if cfg.duration_min else ("hasta fin programado" if cfg.end_at else "hasta que la pares")
+        if cfg.duration_min:
+            dur = f"{cfg.duration_min} min"
+        elif cfg.end_at:
+            dur = "hasta fin programado"
+        elif cfg.auto_limit_min:
+            dur = f"hasta que la pares (máx. {cfg.auto_limit_min // 60} h, ampliable)"
+        else:
+            dur = "hasta que la pares"
         self.log(f"Inicio [{cfg.origin}] «{cfg.basename}» · {cfg.quality} · {cfg.fmt} · {dur}"
                  + (f" · cortes cada {cfg.split_min} min" if cfg.split_min else ""))
 
@@ -493,7 +655,10 @@ class App(ctk.CTk):
             parts = [rec.status, f"transcurrido {core.fmt_duration(now - rec.started_at)}"]
             rem = rec.remaining()
             if rem is not None and not rec.finished:
-                parts.append(f"quedan {core.fmt_duration(rem)}")
+                parts.append(f"{'tope' if rec.extendable else 'quedan'} {core.fmt_duration(rem)}")
+                if rec.extendable and not rec.limit_warned and rem <= WARN_BEFORE_MIN * 60:
+                    rec.limit_warned = True
+                    self._ask_extend(rec)
             parts.append(core.fmt_bytes(rec.recorded_bytes))
             parts.append(f"{len(rec.files)} archivo(s)")
             if rec.error:
@@ -511,10 +676,18 @@ class App(ctk.CTk):
             self._refresh_schedules()
         self.after(1000, self._tick)
 
+    def _ask_extend(self, rec: core.Recording):
+        old = self._limit_dialogs.pop(rec.id, None)
+        if old is not None and old.winfo_exists():
+            old.destroy()
+        self._limit_dialogs[rec.id] = LimitDialog(self, rec)
+
     # ----------------------------------------------------------- programación
     def open_schedule_dialog(self):
         try:
             cfg = self._collect()
+        except Cancelled:
+            return
         except ValueError as e:
             messagebox.showwarning("Revisa los datos", str(e))
             return
@@ -590,6 +763,68 @@ class App(ctk.CTk):
         self.destroy()
 
 
+class LimitDialog(ctk.CTkToplevel):
+    """Aviso a las 4 h 50: ¿seguir grabando 5 h más? Por defecto: No."""
+
+    def __init__(self, app: App, rec: core.Recording):
+        super().__init__(app)
+        self.app, self.rec = app, rec
+        self.title("¿Seguir grabando?")
+        try:  # centrado sobre la ventana principal
+            x = app.winfo_rootx() + app.winfo_width() // 2 - 230
+            y = app.winfo_rooty() + app.winfo_height() // 2 - 110
+            self.geometry(f"460x220+{max(0, x)}+{max(0, y)}")
+        except tk.TclError:
+            self.geometry("460x220")
+        self.resizable(False, False)
+        self.attributes("-topmost", True)
+        self.after(250, lambda: set_icon(self))
+        horas = EXTEND_MIN // 60
+        ctk.CTkLabel(self, text=f"«{rec.cfg.basename}»", font=ctk.CTkFont(size=15, weight="bold"),
+                     wraplength=420).pack(padx=20, pady=(18, 4))
+        self.msg = ctk.CTkLabel(self, text="", justify="center")
+        self.msg.pack(padx=20, pady=4)
+        b = ctk.CTkFrame(self, fg_color="transparent")
+        b.pack(pady=16)
+        self.no_btn = ctk.CTkButton(b, text="No, terminar", width=150, fg_color=RED, hover_color=RED_HOVER,
+                                    border_width=2, border_color="white", command=self._no)
+        self.no_btn.pack(side="left", padx=8)
+        ctk.CTkButton(b, text=f"Sí, {horas} horas más", width=150, fg_color="gray30",
+                      command=self._yes).pack(side="left", padx=8)
+        # "No" es la opción por defecto: Enter o Escape = No
+        self.bind("<Return>", lambda _e: self._no())
+        self.bind("<Escape>", lambda _e: self._no())
+        self.protocol("WM_DELETE_WINDOW", self._no)
+        try:
+            app.deiconify()
+            self.lift()
+            self.focus_force()
+            self.bell()
+        except tk.TclError:
+            pass
+        self._update()
+
+    def _update(self):
+        if not self.winfo_exists():
+            return
+        if self.rec.finished:
+            self.destroy()
+            return
+        rem = self.rec.remaining() or 0
+        self.msg.configure(text=f"La grabación lleva {core.fmt_duration(time.time() - self.rec.started_at)}.\n"
+                                f"Se detendrá automáticamente en {core.fmt_duration(rem)}.\n\n"
+                                f"¿Quieres que siga grabando {EXTEND_MIN // 60} horas más?")
+        self.after(1000, self._update)
+
+    def _yes(self):
+        self.rec.extend(EXTEND_MIN)
+        self.destroy()
+
+    def _no(self):
+        self.app.log(f"«{self.rec.cfg.basename}»: no se amplía; terminará al llegar al tope.")
+        self.destroy()
+
+
 class ScheduleDialog(ctk.CTkToplevel):
     def __init__(self, app: App, cfg: core.JobConfig):
         super().__init__(app)
@@ -599,6 +834,7 @@ class ScheduleDialog(ctk.CTkToplevel):
         self.resizable(False, False)
         self.transient(app)
         self.after(100, self.grab_set)
+        self.after(250, lambda: set_icon(self))  # customtkinter pone el suyo a los 200 ms
         self.grid_columnconfigure(1, weight=1)
 
         start = datetime.now() + timedelta(minutes=5)
@@ -649,6 +885,7 @@ class ScheduleDialog(ctk.CTkToplevel):
         ctk.CTkButton(b, text="Cancelar", fg_color="gray30", command=self.destroy).pack(side="right", padx=4)
         ctk.CTkButton(b, text="Guardar programación", command=self._save).pack(side="right", padx=4)
         self._upd()
+        app._attach_context_menus(self)
 
     def _upd(self):
         once = self.repeat.get() == "Una vez"
@@ -686,6 +923,12 @@ class ScheduleDialog(ctk.CTkToplevel):
 
 
 def main():
+    if os.name == "nt":
+        try:  # para que la barra de tareas use nuestro icono y no el de Python
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("elunele.GrabadorDirectos")
+        except Exception:  # noqa: BLE001
+            pass
     App().mainloop()  # customtkinter ya gestiona el escalado DPI de Windows
 
 

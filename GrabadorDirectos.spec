@@ -13,6 +13,8 @@ for f in glob.glob(os.path.join("bin", "*")):
     binaries.append((f, "bin"))
 
 icon = "icono.ico" if os.path.exists("icono.ico") else None
+if icon:
+    datas.append((icon, "."))   # para el icono de la ventana y la barra de tareas
 
 a = Analysis(["run.py"], pathex=["."], binaries=binaries, datas=datas,
              hiddenimports=hiddenimports + ["mpv", "grabador.app", "grabador.core"],

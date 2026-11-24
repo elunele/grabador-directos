@@ -23,6 +23,10 @@ Equivalencias con tu comando:
 
 Si el directo se corta, la app se reconecta sola y sigue en un archivo nuevo.
 
+**Tope de seguridad:** con *Grabar ahora* + *Hasta que la pare*, la grabación se para sola a las
+**5 horas**. A las 4 h 50 min aparece un aviso: *"Sí, 5 horas más"* la amplía; *"No"* (opción por
+defecto) o no contestar la termina a las 5 h. Las grabaciones programadas no tienen este tope.
+
 ## Compilar el .exe con GitHub Actions
 
 1. Crea un repositorio (p. ej. `grabador-directos`) y sube esta carpeta tal cual.

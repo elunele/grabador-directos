@@ -185,6 +185,19 @@ def pick_stream_name(names, max_height, audio_only=False):
     return "best" if "best" in names else (parsed[-1][2] if parsed else None)
 
 
+def preview_url_for(url: str) -> str | None:
+    """URL HLS (≤480p) recién pedida para la vista previa, o None si no emite."""
+    streams = get_session().streams(url)
+    if not streams:
+        return None
+    name = pick_stream_name(list(streams), 480) or "worst"
+    st = streams.get(name) or streams.get("worst")
+    try:
+        return st.to_url()
+    except Exception:  # noqa: BLE001
+        return getattr(st, "url", None)
+
+
 @dataclass
 class LinkInfo:
     url: str
@@ -282,6 +295,7 @@ class JobConfig:
     kind: str = "directo"          # directo | video
     end_at: float | None = None    # marca de tiempo fija de fin (programaciones)
     origin: str = "manual"
+    auto_limit_min: int = 0        # "hasta que la pare": tope de seguridad ampliable (0 = sin tope)
 
 
 class Recording(threading.Thread):
@@ -296,14 +310,19 @@ class Recording(threading.Thread):
         self.files: list[str] = []
         self.error = ""
         self.finished = False
-        self._stop = threading.Event()
+        self._stop_evt = threading.Event()
         self._fd = None
         self._ffmpeg = None
         self._log_cb = log or (lambda *_: None)
+        self.extendable = False          # True si el límite es el tope de seguridad ampliable
+        self.limit_warned = False        # ya se mostró el aviso de este tramo
         if cfg.end_at:
             self.deadline = cfg.end_at
         elif cfg.duration_min > 0:
             self.deadline = self.started_at + cfg.duration_min * 60
+        elif cfg.auto_limit_min > 0 and cfg.kind == "directo":
+            self.deadline = self.started_at + cfg.auto_limit_min * 60
+            self.extendable = True
         else:
             self.deadline = None
 
@@ -312,7 +331,7 @@ class Recording(threading.Thread):
         self._log_cb(f"[{datetime.now():%H:%M:%S}] [{self.cfg.basename}] {msg}")
 
     def stop(self):
-        self._stop.set()
+        self._stop_evt.set()
         fd = self._fd
         if fd is not None:
             try:
@@ -320,9 +339,17 @@ class Recording(threading.Thread):
             except Exception:  # noqa: BLE001
                 pass
 
+    def extend(self, minutes: int):
+        """Amplía el tope de seguridad (p. ej. 5 h más)."""
+        if self.deadline is not None and not self.finished:
+            self.deadline += minutes * 60
+            self.limit_warned = False
+            self.log(f"Grabación ampliada {minutes // 60} h {minutes % 60:02d} min. "
+                     f"Nuevo fin: {datetime.fromtimestamp(self.deadline):%d/%m %H:%M}")
+
     @property
     def stopping(self) -> bool:
-        return self._stop.is_set() or (self.deadline is not None and time.time() >= self.deadline)
+        return self._stop_evt.is_set() or (self.deadline is not None and time.time() >= self.deadline)
 
     def remaining(self) -> float | None:
         return None if self.deadline is None else max(0.0, self.deadline - time.time())
@@ -375,7 +402,7 @@ class Recording(threading.Thread):
                 tope = self.cfg.retry_max or "∞"
                 self.status = f"Esperando emisión ({attempts}/{tope})"
                 self.log(f"Sin emisión. Reintento en {self.cfg.retry_interval}s ({attempts}/{tope})")
-                self._stop.wait(self.cfg.retry_interval)
+                self._stop_evt.wait(self.cfg.retry_interval)
                 continue
             name = pick_stream_name(list(streams), max_h, audio_only)
             stream = streams[name]
@@ -391,7 +418,7 @@ class Recording(threading.Thread):
                 return
             self.status = "Reconectando"
             self.log("Se cortó la emisión, reconectando…")
-            self._stop.wait(min(5, self.cfg.retry_interval) if attempts <= 1 else self.cfg.retry_interval)
+            self._stop_evt.wait(min(5, self.cfg.retry_interval) if attempts <= 1 else self.cfg.retry_interval)
 
     def _record_once(self, stream, pattern, audio_only, codec, muxer):
         split = self.cfg.split_min * 60 if self.cfg.split_min > 0 else 10 ** 7
@@ -422,10 +449,10 @@ class Recording(threading.Thread):
                 self.recorded_bytes += len(data)
                 self._refresh_files(before)
         except (OSError, ValueError) as e:
-            if not self._stop.is_set():
+            if not self._stop_evt.is_set():
                 self.log(f"Corte de lectura/escritura: {e}")
         except Exception as e:  # noqa: BLE001
-            if not self._stop.is_set():
+            if not self._stop_evt.is_set():
                 self.log(f"Error del stream: {e}")
         finally:
             self.recording_seconds += time.time() - t0
@@ -502,7 +529,7 @@ class Recording(threading.Thread):
         self.log("Descargando vídeo con yt-dlp…")
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([self.cfg.url])
-        if self._stop.is_set():
+        if self._stop_evt.is_set():
             self.status = "Cancelada"
             return
         produced = [p for p in self._existing()
@@ -513,7 +540,7 @@ class Recording(threading.Thread):
             self._split_file(produced[0])
 
     def _yt_hook(self, d):
-        if self._stop.is_set():
+        if self._stop_evt.is_set():
             raise yt_dlp_cancel()
         if d.get("status") == "downloading":
             self.recorded_bytes = d.get("downloaded_bytes") or self.recorded_bytes
@@ -646,7 +673,7 @@ class Scheduler(threading.Thread):
         self.log = log or (lambda *_: None)
         self.lock = threading.Lock()
         self.items: list[Schedule] = []
-        self._stop = threading.Event()
+        self._stop_evt = threading.Event()
         self.load()
 
     def load(self):
@@ -681,15 +708,15 @@ class Scheduler(threading.Thread):
         self.save()
 
     def stop(self):
-        self._stop.set()
+        self._stop_evt.set()
 
     def run(self):
-        while not self._stop.is_set():
+        while not self._stop_evt.is_set():
             try:
                 self.tick(datetime.now())
             except Exception as e:  # noqa: BLE001
                 self.log(f"Programador: {e}")
-            self._stop.wait(15)
+            self._stop_evt.wait(15)
 
     def tick(self, now: datetime):
         to_launch = []
