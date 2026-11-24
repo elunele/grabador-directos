@@ -1,0 +1,73 @@
+name: Compilar .exe (Windows)
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Descargar ffmpeg, libmpv y deno
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force bin, tmp | Out-Null
+
+          Invoke-WebRequest "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" -OutFile tmp/ffmpeg.zip
+          Expand-Archive tmp/ffmpeg.zip tmp/ffmpeg -Force
+          Get-ChildItem tmp/ffmpeg -Recurse -Filter ffmpeg.exe | Select-Object -First 1 | Copy-Item -Destination bin/
+
+          gh release download -R shinchiro/mpv-winbuild-cmake --pattern "mpv-dev-x86_64-2*.7z" -D tmp
+          $mpv = Get-ChildItem tmp -Filter "mpv-dev-x86_64-2*.7z" | Select-Object -First 1
+          7z x $mpv.FullName -otmp/mpv -y | Out-Null
+          Get-ChildItem tmp/mpv -Recurse -Filter libmpv-2.dll | Select-Object -First 1 | Copy-Item -Destination bin/
+
+          Invoke-WebRequest "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip" -OutFile tmp/deno.zip
+          Expand-Archive tmp/deno.zip bin -Force
+
+          Get-ChildItem bin | Format-Table Name, Length
+
+      - name: Comprobar binarios
+        shell: pwsh
+        run: |
+          $env:PATH = "$PWD\bin;$env:PATH"
+          bin\ffmpeg.exe -hide_banner -version | Select-Object -First 1
+          bin\deno.exe --version
+          python -c "import mpv; print('libmpv OK')"
+          python run.py --selftest "https://www.youtube.com/@NASA/live"
+
+      - name: Compilar con PyInstaller
+        run: pyinstaller --noconfirm GrabadorDirectos.spec
+
+      - name: Empaquetar
+        shell: pwsh
+        run: Compress-Archive -Path dist/GrabadorDirectos -DestinationPath GrabadorDirectos-win64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GrabadorDirectos-win64
+          path: dist/GrabadorDirectos
+
+      - name: Publicar Release (solo con tag v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: GrabadorDirectos-win64.zip
